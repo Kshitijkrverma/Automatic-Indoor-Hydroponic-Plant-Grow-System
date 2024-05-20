@@ -1,0 +1,372 @@
+#include <LiquidCrystal_I2C.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <NonBlockingDallas.h>                  //Include the NonBlockingDallas library
+#include <SoftwareSerial.h>
+
+SoftwareSerial mySerial(11, 12); // RX, TX
+
+
+#define ONE_WIRE_BUS 2                          //PIN of the Maxim DS18B20 temperature sensor
+#define TIME_INTERVAL 2000                      //Time interval among sensor readings [milliseconds]
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature dallasTemp(&oneWire);
+NonBlockingDallas temperatureSensors(&dallasTemp);    //Create a new instance of the NonBlockingDallas class
+
+
+unsigned long startMillis;  //some global variables available anywhere in the program
+unsigned long currentMillis;
+const unsigned long period = 1000;  //the value is a number of milliseconds
+
+LiquidCrystal_I2C lcd(0x27,20,4);
+
+#define TdsSensorPin A0
+#define VREF 5.0      // analog reference voltage(Volt) of the ADC
+#define SCOUNT  30           // sum of sample point
+int analogBuffer[SCOUNT];    // store the analog value in the array, read from ADC
+int analogBufferTemp[SCOUNT];
+int analogBufferIndex = 0,copyIndex = 0;
+float averageVoltage = 0,tdsValue = 0,temperature = 25;
+
+#define phSensorPin A1
+#define soilSensor A2
+//#define triggerType A3
+#define phLowTime A6
+#define phHighTime A7
+
+int timecnt = 0;
+int relay1OnTime = 0;
+int relay1OffTime = 0;
+int relay2OnTime = 0;
+int relay2OffTime = 0;
+unsigned long int avgval_ADC;
+//var ph
+float b;
+int buf[10];
+int temp = 0;
+unsigned long int avgValue;  
+float phValue;
+
+int soilValue = 0;
+int lowTime = 0;
+int highTime = 0;
+int temp1 ;
+int targetPhInt = 0;
+float targetPh = 0.0;
+
+#define relay1 3
+#define relay2 4
+
+int getMedianNum(int bArray[], int iFilterLen) 
+{
+      int bTab[iFilterLen];
+      for (byte i = 0; i<iFilterLen; i++)
+      bTab[i] = bArray[i];
+      int i, j, bTemp;
+      for (j = 0; j < iFilterLen - 1; j++) 
+      {
+      for (i = 0; i < iFilterLen - j - 1; i++) 
+          {
+        if (bTab[i] > bTab[i + 1]) 
+            {
+        bTemp = bTab[i];
+            bTab[i] = bTab[i + 1];
+        bTab[i + 1] = bTemp;
+         }
+      }
+      }
+      if ((iFilterLen & 1) > 0)
+    bTemp = bTab[(iFilterLen - 1) / 2];
+      else
+    bTemp = (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
+      return bTemp;
+}
+
+int getTds(){
+     static unsigned long analogSampleTimepoint = millis();
+   if(millis()-analogSampleTimepoint > 40U)     //every 40 milliseconds,read the analog value from the ADC
+   {
+     analogSampleTimepoint = millis();
+     analogBuffer[analogBufferIndex] = analogRead(TdsSensorPin);    //read the analog value and store into the buffer
+     analogBufferIndex++;
+     if(analogBufferIndex == SCOUNT) 
+         analogBufferIndex = 0;
+   }   
+   static unsigned long printTimepoint = millis();
+   if(millis()-printTimepoint > 800U)
+   {
+      printTimepoint = millis();
+      for(copyIndex=0;copyIndex<SCOUNT;copyIndex++)
+        analogBufferTemp[copyIndex]= analogBuffer[copyIndex];
+      averageVoltage = getMedianNum(analogBufferTemp,SCOUNT) * (float)VREF / 1024.0; // read the analog value more stable by the median filtering algorithm, and convert to voltage value
+      float compensationCoefficient=1.0+0.02*(temperature-25.0);    //temperature compensation formula: fFinalResult(25^C) = fFinalResult(current)/(1.0+0.02*(fTP-25.0));
+      float compensationVolatge=averageVoltage/compensationCoefficient;  //temperature compensation
+      tdsValue=(133.42*compensationVolatge*compensationVolatge*compensationVolatge - 255.86*compensationVolatge*compensationVolatge + 857.39*compensationVolatge)*0.5; //convert voltage value to tds value
+      //Serial.print("voltage:");
+      //Serial.print(averageVoltage,2);
+      //Serial.print("V   ");
+      Serial.print("TDS Value:");
+      Serial.print(tdsValue,0);
+      Serial.println("ppm");
+      return tdsValue;
+   }
+
+}
+int getSoil(){
+  int totalRes = 0;
+  int res = 0;
+  for (int i = 0; i < 16; i++){
+    res = analogRead(soilSensor);
+    delay(5);
+    totalRes = totalRes + res;
+    
+  }
+  res = totalRes >> 4;
+  return res;
+}
+void setup() {
+  // put your setup code here, to run once:
+  delay(500);
+  pinMode(relay1,OUTPUT);
+  pinMode(relay2,OUTPUT);
+  digitalWrite(relay1,HIGH);
+  digitalWrite(relay2,HIGH);
+  mySerial.begin(9600);
+  Serial.begin(9600);
+  lcd.init();                      // initialize the lcd 
+  lcd.backlight();
+  lcd.clear();
+  lcd.home();
+  lcd.print("    Ph TDS Soil");
+  lcd.setCursor(0,1);
+  lcd.print("     Controller");
+  lcd.setCursor(0,2);
+  lcd.print("  Using Blynk IOT");
+  
+
+  //Initialize the sensor passing the resolution and reading interval [milliseconds]
+  temperatureSensors.begin(NonBlockingDallas::resolution_12, TIME_INTERVAL);
+
+  //Callbacks
+  temperatureSensors.onIntervalElapsed(handleIntervalElapsed);
+  temperatureSensors.onTemperatureChange(handleTemperatureChange);
+  temperatureSensors.onDeviceDisconnected(handleDeviceDisconnected);
+  
+  //Call the following function whenever you want to request a new temperature reading without waiting for TIME_INTERVAL to elapse
+  temperatureSensors.requestTemperature();
+  delay(2000);
+  
+  startMillis = millis();  //initial start time
+  
+}
+
+void loop() {
+  // put your main code here, to run repeatedly:
+  currentMillis = millis();  
+  if (currentMillis - startMillis >= period){
+    Serial.println(millis());
+    
+  temperatureSensors.update();
+  
+  lcd.clear();
+  lcd.home();
+  int res = getSoil();
+  Serial.println(res);
+  soilValue = map(res,430,1010,100,0);
+  if (soilValue < 0){
+    soilValue = 0;
+  }
+  
+  if (soilValue > 100){
+    soilValue = 100;
+  }
+  lcd.print("Soil:");
+  lcd.print(soilValue);
+  lcd.print("%");
+  Serial.println(soilValue);
+  
+  int tdsRes = getTds();
+
+  
+  lcd.setCursor(10,0);
+  lcd.print("TDS:");
+  lcd.print(tdsRes);
+
+  
+  
+
+  lcd.setCursor(0,1);
+  lcd.print("Temp:");
+  lcd.print(temp1);
+  lcd.print(char(223));
+  lcd.print("C");
+
+  lcd.setCursor(10,1);
+  lcd.print("pH:");
+  phValue = getPh();
+  lcd.print(phValue);
+
+  //timer time
+
+  int t = analogRead(A6);
+  lowTime = map(t,0,1023,0,60);
+
+  lcd.setCursor(0,2);
+  lcd.print("Off:");
+  lcd.print(lowTime);
+
+  t = analogRead(A7);
+  highTime = map(t,0,1023,0,60);
+  lcd.setCursor(10,2);
+  lcd.print("On:");
+  lcd.print(highTime);
+
+  t = analogRead(A3);
+  targetPhInt = map(t, 0,1023,0,150);
+  targetPh = targetPhInt/10.0;
+  lcd.setCursor(0,3);
+  lcd.print("Target Ph:");
+  lcd.print(targetPh);
+  
+  
+  timecnt++;
+  if (timecnt >= 2){
+    Serial.println("sending data to blynk");
+    timecnt = 0;
+    mySerial.print("#");
+    mySerial.print(soilValue);
+    mySerial.print(",");
+    mySerial.print(tdsValue);
+    mySerial.print(",");
+    mySerial.print(temp1);
+    mySerial.print(",");
+    mySerial.print(phValue);
+    mySerial.print(",");
+
+  }
+  
+
+  
+  if (phValue < targetPh + 0.2){
+    if (relay1OnTime < highTime){
+      digitalWrite(relay1,LOW);
+      relay1OnTime++;
+    }else{
+      
+      if (relay1OffTime < lowTime){
+      digitalWrite(relay1,HIGH);
+      relay1OffTime++;  
+      }else{
+        relay1OnTime = 0;
+        relay1OffTime = 0;
+      }
+    }
+
+    
+    
+    
+     
+  }
+
+  if (phValue > targetPh + 0.2){
+    if (relay2OnTime < highTime){
+      digitalWrite(relay2,LOW);
+      relay2OnTime++;
+    }else{
+      
+      if (relay2OffTime < lowTime){
+      digitalWrite(relay2,HIGH);
+      relay2OffTime++;  
+      }else{
+        relay2OnTime = 0;
+        relay2OffTime = 0;
+      }
+    
+  }
+  }
+  
+  
+  
+//unsigned long startMillis;  //some global variables available anywhere in the program
+//unsigned long currentMillis;
+  
+   startMillis = currentMillis; 
+  }//millis()
+}
+
+float getPh(){
+  float result;
+  for(int i=0;i<10;i++)       //Get 10 sample value from the sensor for smooth the value
+  { 
+    buf[i]=analogRead(phSensorPin);
+    delay(10);
+  }
+  for(int i=0;i<9;i++)        //sort the analog from small to large
+  {
+    for(int j=i+1;j<10;j++)
+    {
+      if(buf[i]>buf[j])
+      {
+        temp=buf[i];
+        buf[i]=buf[j];
+        buf[j]=temp;
+      }
+    }
+  }
+  avgValue=0;
+  for(int i=2;i<8;i++)                      //take the average value of 6 center sample
+    avgValue+=buf[i];
+  float phValue=(float)avgValue*5.0/1024/6; //convert the analog into millivolt
+  phValue=3.5*phValue;    
+  return phValue;
+}
+
+
+//Invoked at every VALID sensor reading. "valid" parameter will be removed in a feature version
+void handleIntervalElapsed(int deviceIndex, int32_t temperatureRAW)
+{
+  /* 
+  Serial.print(F("[NonBlockingDallas] handleIntervalElapsed ==> deviceIndex="));
+  Serial.print(deviceIndex);
+  Serial.print(F(" | RAW="));
+  Serial.print(temperatureRAW);
+  Serial.print(F(" | "));
+  Serial.print(temperatureSensors.rawToCelsius(temperatureRAW));
+  Serial.print(F("°C | "));
+  Serial.print(temperatureSensors.rawToFahrenheit(temperatureRAW));
+  Serial.println(F("°F"));
+ */
+
+  /*
+   *  DO SOME AMAZING STUFF WITH THE TEMPERATURE
+   */
+}
+
+//Invoked ONLY when the temperature changes between two VALID sensor readings. "valid" parameter will be removed in a feature version
+void handleTemperatureChange(int deviceIndex, int32_t temperatureRAW)
+{
+  Serial.print(F("[NonBlockingDallas] handleTemperatureChange ==> deviceIndex="));
+  Serial.print(deviceIndex);
+  Serial.print(F(" | RAW="));
+  Serial.print(temperatureRAW);
+  Serial.print(F(" | "));
+  Serial.print(temperatureSensors.rawToCelsius(temperatureRAW));
+  temp1 = temperatureSensors.rawToCelsius(temperatureRAW);
+  
+  Serial.print(F("°C | "));
+  Serial.print(temperatureSensors.rawToFahrenheit(temperatureRAW));
+  Serial.println(F("°F"));
+  
+  /*
+   *  DO SOME AMAZING STUFF WITH THE TEMPERATURE
+   */
+}
+
+//Invoked when the sensor reading fails
+void handleDeviceDisconnected(int deviceIndex)
+{
+  Serial.print(F("[NonBlockingDallas] handleDeviceDisconnected ==> deviceIndex="));
+  Serial.print(deviceIndex);
+  Serial.println(F(" disconnected."));
+}
